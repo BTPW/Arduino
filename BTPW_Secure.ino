@@ -6,7 +6,7 @@
 #include <AES.h>
 #include <Keyboard.h>
 
-#define DEBUG
+//#define DEBUG
 
 #define KEY_SIZE 32
 #define VERSION_ID "BTPW v0.1.0"
@@ -84,6 +84,7 @@ struct KEFState {
   char generating : 1;
   size_t index : 4;
   unsigned long last_comm;
+  char heartbeat : 1;
 };
 
 enum Command {
@@ -125,13 +126,17 @@ uint8_t enc_data_index;
 
 
 
+char to_hex(uint8_t key, size_t index) {
+  return HEX_LOOKUP[(key >> (index << 2)) & 0xF];
+}
+
 void init_rng() {
   RNG.begin(VERSION_ID);
   RNG.addNoiseSource(roNoise);
 }
 
 // Assumes that RNG is configured
-void init_eeprom() {
+char init_eeprom() {
   RNG.loop();
 
   char * eeprom_data_c = (char *)&eeprom_data;
@@ -146,7 +151,56 @@ void init_eeprom() {
     eeprom_data.canary = EEPROM_DATA_CANARY;
 
     save_eeprom_data();
+
+    return 1;
   }
+  return 0;
+}
+
+void init_bt() {
+  static char device_name_hex[(DEVICE_NAME_SIZE * 2) + 1] = { }; //{ [(DEVICE_NAME_SIZE * 2)] = 0 }; // "sorry, unimplemented: non-trivial designated initializers not supported" >:(
+  
+  for (int8_t i = sizeof(device_name_hex) - 2; i >= 0; --i) {
+    device_name_hex[i] = to_hex(eeprom_data.device_name[i >> 1], i & 1);
+  }
+
+  Serial1.begin(9600);
+  delay(100); // Give BT module some time to initialize
+  
+  Serial1.print("AT+NAMEBTPW-");
+  Serial1.print(device_name_hex);
+
+  // OKsetname
+  uint8_t count = 0;
+  while (count < 9) {
+    if (Serial1.available()) {
+      ++count;
+#ifdef DEBUG
+      Serial.print(Serial1.read());
+#else
+      Serial1.read();
+#endif
+    }
+  }
+
+  Serial1.print("AT+PIN0000");
+
+  // OKsetPIN
+  count = 0;
+  while (count < 8) {
+    if (Serial1.available()) {
+      ++count;
+#ifdef DEBUG
+      Serial.print(Serial1.read());
+#else
+      Serial1.read();
+#endif
+    }
+  }
+
+#ifdef DEBUG
+  Serial.println("Done!");
+#endif
 }
 
 // Save data to eeprom
@@ -170,10 +224,6 @@ raw_key regen_key() {
   raw_key key;
   RNG.rand((uint8_t *)&key, sizeof(key));
   return key;
-}
-
-char to_hex(raw_key key, size_t index) {
-  return HEX_LOOKUP[(key >> (index * 4)) & 0xF];
 }
 
 void print_display(char value) {
@@ -274,17 +324,24 @@ void hex_decode_raw() {
 }
 
 void setup() {
-  Serial1.begin(115200);
 #ifdef DEBUG
   Serial.begin(115200);
+  while(!Serial.available());
 #endif
   // Initialize ports
   DDRD |= 0b00000001;
   DDRB |= 0b11101110;
   
-  init_rng();
-  init_eeprom();
   clear_display();
+  
+  init_rng();
+  char first_init = init_eeprom();
+  if (first_init) {
+    // Only initialize bluetooth device once
+    init_bt();
+  } else {
+    Serial1.begin(9600);
+  }
 
   aes.setKey((uint8_t *)eeprom_data.key, KEY_SIZE);
   kef_state.generating = 0;
@@ -337,7 +394,7 @@ void loop() {
     case NONE: {
       // Await command from remote device
       read_next_state();
-      break;
+      goto SKIP_COMM_CHECK;
     }
 
     case ENCRYPTED: {
@@ -369,11 +426,14 @@ void loop() {
       if(!kef_state.generating) {
         kef_init();
         kef_state.last_comm = millis();
+        kef_state.heartbeat = 0;
         Serial1.println("Initiated");
       }
       enum Command new_state = read_next_state();
       if (new_state == KEF_INIT) {
         kef_state.generating = 0;
+        kef_state.last_comm = millis();
+        kef_state.heartbeat = 0;
       }
       break;
     }
@@ -391,6 +451,7 @@ void loop() {
       if (kef_state.generating) {
         kef_next();
         kef_state.last_comm = millis();
+        kef_state.heartbeat = 0;
         Serial1.println("Next");
         current_state = KEF_INIT;
       }
@@ -401,6 +462,7 @@ void loop() {
       if (kef_state.generating) {
         kef_back();
         kef_state.last_comm = millis();
+        kef_state.heartbeat = 0;
         Serial1.println("Back");
         current_state = KEF_INIT;
       }
@@ -411,6 +473,7 @@ void loop() {
       if (kef_state.generating) {
         Serial1.println("H3RTB34T"); // Heartbeat message :)
         kef_state.last_comm = millis();
+        kef_state.heartbeat = 0;
         current_state = KEF_INIT;
       }
       break;
@@ -418,6 +481,9 @@ void loop() {
 
     case KEF_VERIFY: {
       if (kef_state.generating) {
+        kef_state.last_comm = millis();
+        kef_state.heartbeat = 0;
+        
         int8_t read_result = read_block();
         if (read_result == 1 && kef_verify()) {
           Serial1.println("OK");
@@ -438,13 +504,16 @@ void loop() {
   if (current_state == KEF_INIT) {
     unsigned long time_since = millis() - kef_state.last_comm;
     if (time_since > KEF_TIMEOUT_CANCEL) {
-      Serial.println("Cancelled");
+      Serial1.println("Cancelled");
       kef_cancel();
       current_state = NONE;
-    } else if (time_since > KEF_TIMEOUT) {
-      Serial.println("HEARTBEAT?");
+    } else if (time_since > KEF_TIMEOUT && !kef_state.heartbeat) {
+      Serial1.println("HEARTBEAT?");
+      kef_state.heartbeat = 1;
     }
   }
+
+SKIP_COMM_CHECK: {}
   
 #ifdef DEBUG
   while (Serial.available()) {
