@@ -11,6 +11,7 @@
 #define KEY_SIZE 32
 #define VERSION_ID "BTPW v0.1.0"
 #define EEPROM_DATA_CANARY 0xDEADCAFE
+#define ENCRYPTED_DATA_CANARY 0xDEADCAFEBEEF1337
 #define DEVICE_NAME_SIZE 4
 #define BLOCK_SIZE 16
 #define STATE_COUNT 8
@@ -103,9 +104,9 @@ enum EncryptedCommand {
 };
 
 struct CommandData {
-  enum EncryptedCommand command;
+  uint64_t canary;
+  enum EncryptedCommand command : 8;
   uint16_t aux;
-  uint8_t next_offset;
 };
 
 
@@ -113,7 +114,6 @@ SHA512 hash;
 AES256 aes;
 RingOscillatorNoiseSource roNoise;
 struct EEPROMData eeprom_data;
-uint8_t next_offset;
 enum Command current_state;
 
 // Transient values used during key establishment
@@ -210,19 +210,33 @@ void kef_back() {
   }
 }
 
+uint8_t check_block_canary() {
+  uint8_t match_count = 0;
+  uint8_t t = 0;
+  for (; (t < (BLOCK_SIZE + match_count - sizeof(BLOCK_VERIFY_CANARY))) && (match_count - sizeof(BLOCK_VERIFY_CANARY)); ++t) {
+    if (decrypted[t] == BLOCK_VERIFY_CANARY[match_count]) {
+      ++match_count;
+    } else {
+      match_count = 0;
+    }
+  }
+
+  return match_count == sizeof(BLOCK_VERIFY_CANARY);
+}
+
 char kef_verify() {
   do_hash();
   aes.setKey((uint8_t *)kef_state.key_hash, KEY_SIZE);
   aes.decryptBlock((uint8_t *)decrypted, aes_data);
 
-  uint8_t padding = read_block_padding();
   kef_state.generating = 0;
-  if (padding <= (BLOCK_SIZE - sizeof(CommandData))) {
+  if (check_block_canary()) {
     memcpy(eeprom_data.key, (void *)kef_state.key, KEY_SIZE);
     save_eeprom_data();
-    next_offset = padding;
     return 1;
   }
+
+  // Check failed
   aes.setKey((uint8_t *)eeprom_data.key, KEY_SIZE);
   return 0;
 }
@@ -257,28 +271,6 @@ void hex_decode_raw() {
   for (size_t s = 0; s < sizeof(raw_enc_data); ++s) {
     aes_data[s >> 1] |= parse_hex(raw_enc_data[s]) << ((s & 1) << 2);
   }
-}
-
-uint8_t read_block_padding() {
-  uint8_t match_count = 0;
-  uint8_t t = 0;
-  for (; (t < (BLOCK_SIZE - 1 + match_count - sizeof(BLOCK_VERIFY_CANARY))) && (match_count - sizeof(BLOCK_VERIFY_CANARY)); ++t) {
-    if (decrypted[t] == BLOCK_VERIFY_CANARY[match_count]) {
-      ++match_count;
-    } else {
-      match_count = 0;
-    }
-  }
-
-  if (match_count != sizeof(BLOCK_VERIFY_CANARY)) {
-    return sizeof(BLOCK_VERIFY_CANARY);
-  }
-
-  return (uint8_t)decrypted[t];
-}
-
-struct CommandData read_command_data(uint8_t offset) {
-  return *(struct CommandData *)(&decrypted[offset]);
 }
 
 void setup() {
@@ -351,16 +343,16 @@ void loop() {
 
     case ENCRYPTED: {
       int8_t read_result = read_block();
-      aes.decryptBlock((uint8_t *)decrypted, aes_data);
 
       if (read_result == 1) {
-        struct CommandData command_data = read_command_data(next_offset);
-        if (command_data.next_offset > BLOCK_SIZE - sizeof(struct CommandData)) {
-          current_state = NONE; // Invalid next offset
+        aes.decryptBlock((uint8_t *)decrypted, aes_data);
+        struct CommandData command_data = *(struct CommandData *)decrypted;
+
+        // Check that 
+        if (command_data.canary != ENCRYPTED_DATA_CANARY) {
+          Serial1.println("NO");
           break;
         }
-
-        next_offset = command_data.next_offset;
 
         switch(command_data.command) {
           case SEND_KEYSTROKE:
