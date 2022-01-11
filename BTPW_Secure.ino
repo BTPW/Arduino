@@ -6,7 +6,7 @@
 #include <AES.h>
 #include <Keyboard.h>
 
-//#define DEBUG
+#define DEBUG
 
 #define KEY_SIZE 32
 #define VERSION_ID "BTPW v0.1.0"
@@ -274,7 +274,10 @@ void hex_decode_raw() {
 }
 
 void setup() {
-  //while (1);
+  Serial1.begin(115200);
+#ifdef DEBUG
+  Serial.begin(115200);
+#endif
   // Initialize ports
   DDRD |= 0b00000001;
   DDRB |= 0b11101110;
@@ -288,10 +291,6 @@ void setup() {
   current_state = NONE;
 
   Keyboard.begin();
-  Serial1.begin(9600);
-#ifdef DEBUG
-  Serial.begin(115200);
-#endif
 }
 
 enum Command read_next_state() {
@@ -446,4 +445,12 @@ void loop() {
       Serial.println("HEARTBEAT?");
     }
   }
+  
+#ifdef DEBUG
+  while (Serial.available()) {
+    char c = Serial.read();
+    Serial1.print(c);
+    Serial.print(c);
+  }
+#endif
 }
